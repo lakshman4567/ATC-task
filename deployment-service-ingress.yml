@@ -1,0 +1,58 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: nodejs-application
+  labels:
+    app: nodejs-application
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: nodejs-application
+    spec:
+      containers:
+        - name: nodejs-application
+          image: ${dockerHubUsername}/nodejs-application:v1
+          env:
+            - name: APP_NAME
+              value: "nodejs-application"
+            - name: PORT
+              value: "80"
+          ports:
+            - containerPort: 80
+              name: nodejs-application
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nodejs-service-nodeport
+spec:
+  type: NodePort
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
+  selector:
+    app: nodejs-application
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingress-alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+        - path: /
+          pathType: Prefix
+          backend:
+            service:
+              name: nodejs-service-nodeport
+              port:
+                number: 80

@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: This Template deploys all the resources required for an EKS Cluster and the cluster itself
+
+Mappings:
+  ServicePrincipals:
+    aws-cn:
+      ec2: ec2.amazonaws.com.cn
+    aws-us-gov:
+      ec2: ec2.amazonaws.com
+    aws:
+      ec2: ec2.amazonaws.com
+
+Parameters:
+  clusterName:
+    Description: Name of the EKS Cluster
+    Type: String
+    AllowedPattern: ^[0-9A-Za-z][A-Za-z0-9\-_]*
+    MaxLength: 100
+  KubernetesVersion:
+    Type: String
+    Default: 1.21
+    AllowedValues:
+      - 1.20
+      - 1.21
+  clusterSubnets:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: The subnets where Cluster can be created.
+    AllowedPattern: ^[0-9A-Za-z][A-Za-z0-9\-_]*
+  workerSubnets:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: The subnets where workers can be created.
+    AllowedPattern: ^[0-9A-Za-z][A-Za-z0-9\-_]*
+  DiscSize:
+    Description: The root device disk size (in GiB) for your node group instances
+    Type: String
+    AllowedPattern: ^[0-9A-Za-z][A-Za-z0-9\-_]*
+  instancetype:
+    Type: String
+    Default: t4g.xlarge
+    AllowedValues: 
+      - t3.medium
+      - t4g.xlarge
+  nodegroupname:
+    Description: Name of the nodegroup
+    Type: String  
+  ALBrole:
+    Description: Confirm whether to create ALB-IAM-Role or Not Like (Say 'true' or 'false').
+    Type: String
+    AllowedValues:
+    - yes
+    - no
+
+Conditions:
+  createResource: !Equals [ !Ref ALBrole , 'true']
+
+Resources: 
+  eksClusterRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - eks.amazonaws.com
+            Action:
+            - sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+          
+  eksCluster:
+    Type: AWS::EKS::Cluster
+    Properties: 
+      Name: !Ref clusterName
+      ResourcesVpcConfig: 
+        SubnetIds: !Ref clusterSubnets
+      RoleArn: !GetAtt eksClusterRole.Arn
+      Version: !Ref KubernetesVersion
+  
+  NodeInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  Nodegroup:    
+    Type: AWS::EKS::Nodegroup
+    DependsOn: eksCluster
+    Properties: 
+      AmiType: AL2_x86_64
+      ClusterName: !Ref clusterName
+      DiskSize: !Ref DiscSize
+      InstanceTypes: 
+        - !Ref instancetype
+      NodegroupName: !Ref nodegroupname
+      NodeRole: !GetAtt NodeInstanceRole.Arn
+      ScalingConfig: 
+        DesiredSize: 3
+        MaxSize: 5
+        MinSize: 1
+      Subnets: !Ref workerSubnets
+  
+  ClusterName:
+      Type: Custom::ClusterName
+      DependsOn: eksCluster
+      Properties:
+        ServiceToken: !GetAtt LambdaFunction.Arn
+        cluster_name: !Ref clusterName
+
+  MyIAMRole:
+      Type: AWS::IAM::Role
+      DependsOn: eksCluster
+      Properties:
+        AssumeRolePolicyDocument: !Sub |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Federated": "arn:aws:iam::${AWS::AccountId}:oidc-provider/${ClusterName.oidc}"
+                },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "${ClusterName.oidc}:aud": "system:serviceaccount:default:my-serviceaccount"
+                  }
+                }
+              }
+            ]
+          }
+  LambdaIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'eks:DescribeCluster'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+
+  ALBIngressIAMRole:
+    Condition: createResource
+    Type: AWS::IAM::Role
+    DependsOn: eksCluster
+    Properties:
+      AssumeRolePolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Federated": "arn:aws:iam::${AWS::AccountId}:oidc-provider/${ClusterName.oidc}"
+              },
+              "Action": "sts:AssumeRoleWithWebIdentity"
+            }
+          ]
+        }
+      Policies:
+      - PolicyName: alb-ingress-policy
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - acm:DescribeCertificate
+            - acm:ListCertificates
+            - acm:GetCertificate
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - ec2: "*"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - elasticloadbalancing:*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - iam: "*"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - waf-regional: "*"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - tag:GetResources
+            - tag:TagResources
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - waf:GetWebACL
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - wafv2:GetWebACL
+            - wafv2:GetWebACLForResource
+            - wafv2:AssociateWebACL
+            - wafv2:DisassociateWebACL
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - shield: "*"
+            Resource: "*"
+      Path: "/"  
+Outputs: 
+  OIDC:
+    Description: EKS Cluster OIDC Value
+    Value:
+      Fn::GetAtt:
+      - ClusterName
+      - oidc
